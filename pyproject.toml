@@ -1,0 +1,20 @@
+[project]
+name = "pedantix-project"
+version = "0.1.0"
+description = "Small local Pedantix-like simulator and lightweight solver."
+requires-python = ">=3.10"
+readme = "README.md"
+
+[project.optional-dependencies]
+llm = [
+  "accelerate>=0.30",
+  "datasets>=2.19",
+  "peft>=0.11",
+  "torch>=2.3",
+  "transformers>=4.56",
+  "trl>=0.18",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
