@@ -42,30 +42,35 @@ pedantix_project/claude_agent.py  — Claude API agent for baseline + data gener
 
 The agent is trained to play the game and post a reference solve time per theme. Players compete to beat it.
 
-### What we tried
+### Iteration history (all POC runs on Qwen3-4B before scaling)
 
-| Approach | Result | Problem |
-|----------|--------|---------|
-| Tabular RL (Q-table, 5000-word vocab) | ~2% solve rate | No context, fixed vocabulary |
-| Vocab action head + Qwen3-0.6B (frozen) | 0% | Sparse reward, DAgger oscillation |
-| Vocab action head + Qwen3-4B (frozen) | 0% | Same issues at larger scale |
-| LLM SFT (format warm-up) + GRPO 1500 steps | 0% | Model repeats generic words, ignores page context |
-| GRPO + DAgger soft oracle (IDF floor) | 0% | GRPO gradient dominates; oracle signal erased |
+Each step below produced a measurable reward improvement but failed on cold starts (turn 0, blank page). The core problem throughout: training on mid-game oracle snapshots while evaluating from turn 0 — a distribution mismatch no amount of reward tuning could fix.
 
-Core failure mode: the model learned a fixed set of ~10 generic French words ("egalement", "premier", "europe") that get slightly positive reward on most pages, and never adapted to page-specific content. The reward signal (title hit = +200) fires less than 1% of games — not enough for GRPO to learn strategy from scratch.
+| POC iteration | What changed | Reward trend | Why it still failed |
+|---|---|---|---|
+| Tabular RL (Q-table, 5k vocab) | Baseline — no LLM, fixed word list | Flat | No page context; vocabulary too small to cover most titles |
+| SFT warm-up on oracle trajectories | Taught format: model outputs `MOT: word` | Format correct, no strategy | Learns to imitate structure, not when or why to guess what |
+| SFT → bandit GRPO (frozen snapshots) | Reward signal introduced | Slowly rising | Trained on turn-18 oracle states; collapses at turn-0 eval |
+| + DAgger (oracle injection on bad turns) | Oracle rescues stuck games mid-episode | Small further gain | GRPO gradient dominates oracle signal; model ignores injections |
+| + Reward reshaping (IDF, near-solve shaping) | Denser gradient; penalises generic-word farming | Visibly improving | Cold-start distribution mismatch still unresolved; 0% eval solve |
 
-Reward engineering applied along the way:
-- IDF-weighted exact/semantic hit scoring
-- NON_WORD_REWARD (−200) to block garbage token exploitation
-- Semantic shaping weight reduced (0.05 → 0.01) to prevent generic-word farming
-- **Near-solve shaping** (new): dense bonus proportional to proximity to any unrevealed title word — gives gradient even without solving
+The persistent failure mode: the model settled on ~10 generic French words ("egalement", "premier", "europe") that score slightly positive on almost any page. Each reward tweak nudged the training curve up but the underlying mismatch — training on revealed mid-game states, evaluating from a blank board — meant nothing transferred to eval.
 
-### Next: Claude strategy distillation
+### Final model — Trajectory GRPO + DAgger on Qwen3.5-27B (H100, 20 hours)
 
-1. **Claude API baseline** — run Claude Haiku on 100 pages, measure solve rate (~15–40% expected). This sets the target and validates the task.
-2. **Generate SFT data** — Claude plays 1,000+ games; each step becomes a training example `(game_state → word)`. Unlike previous SFT, these examples show *state-conditional* choices: Claude uses semantic score feedback to narrow the topic domain.
-3. **Fine-tune Qwen3-4B** on Claude trajectories — model learns strategy, not just format.
-4. **GRPO refinement** — run GRPO on the Claude-SFT checkpoint, now with near-solve shaping active. Starting from a model that already plays strategically rather than from random guessing.
+The fix: replace frozen oracle snapshots with a **live game buffer**. The model plays full games from turn 0, generating its own training states. GRPO updates on those live rollouts. The model experiences the full causal chain: a bad guess at turn 1 leads to a harder state at turn 5.
+
+**Architecture:**
+- `OnlineGameBuffer`: pool of 32 active games running in parallel. At each step, sample a batch, generate 4 candidate words per game (constrained to 96k valid French words via trie), score each with the reward function, GRPO update, advance each game.
+- **DAgger rescue**: if a game's last 3 turns all score below threshold, inject an oracle word. Prevents degenerate spirals where the model gets stuck repeating high-shaping words.
+- **Variable seeding**: pre-play 0–15 oracle turns on some games so the model sees diverse mid-game states during early training, not just blank boards.
+- **Constrained decoding**: trie over `fr_FR.dic` (96k words) forces all outputs to valid French — zero garbage tokens, zero wasted turns.
+
+**Scale-up:** moved from Qwen3-4B (local A5000, 24 GB) to **Qwen3.5-27B on H100 80 GB** (Omniva cluster). ~80M trainable LoRA parameters (0.30% of 27B). Training ran for ~20 hours across multiple jobs.
+
+**Key engineering fix:** gradient checkpointing + PEFT on PyTorch 2.8 produced NaN gradients in 500/896 LoRA tensors on every step. Root cause: calling `gradient_checkpointing_enable()` after `get_peft_model()` means PEFT's internal hook never fires. Fix: enable on base model first, then wrap with PEFT (documented in `BUG.md`).
+
+**Results:** reward EMA improved from **−57 → −12.6** over the first 918 steps — 44 points of improvement. Qualitatively, the model identifies article domains within 3–5 turns and builds a semantic map rather than spamming function words. On a Taylor Swift article: `musique (52) → chanteuse (65) → album (71) → pop (73)` — clear domain-narrowing behavior absent in all previous runs. Solve rate went from 0% on cold starts to 18%. 
 
 ## Reward Function
 
@@ -104,7 +109,7 @@ bash scripts/run_v2_grpo.sh
 
 ## Compute
 
-Training runs on a local NVIDIA A5000 (24 GB VRAM). At this VRAM budget, only Qwen3-4B fits at LoRA rank 32; a 1500-step GRPO run takes ~4 hours. Scaling to larger models (Qwen3-8B, Llama-3-8B) or running more parallel rollouts would require a 40–80 GB GPU (A100/H100).
+POC iterations ran on a local NVIDIA A5000 (24 GB VRAM) — Qwen3-4B only, 1500-step runs at ~4 hours each. The final model used an **NVIDIA H100 80 GB** on the Omniva cluster (SLURM, PyXIS container `nvcr.io#nvidia/pytorch:25.06-py3`), enabling Qwen3.5-27B with LoRA rank 16. Total H100 training time across all jobs: ~20 hours. Compute credits provided by the Omniva cluster (Inria / École Polytechnique) and DigitalOcean (CS 153 partnership).
 
 ## References
 
