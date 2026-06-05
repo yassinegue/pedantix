@@ -1,5 +1,5 @@
 
-# WikiBlind
+# Palimot
 
 A French Wikipedia word-guessing game where players uncover the title of a hidden article one word at a time — with solo, multiplayer, and speedrun modes, plus an AI agent as a competitive baseline.
 
@@ -44,17 +44,21 @@ The agent is trained to play the game and post a reference solve time per theme.
 
 ### What we tried
 
-Each iteration below was a proof-of-concept on Qwen3-4B before scaling to larger models. Every step produced a small reward improvement but the model still failed on cold starts (turn 0, blank page).
+| Approach | Result | Problem |
+|----------|--------|---------|
+| Tabular RL (Q-table, 5000-word vocab) | ~2% solve rate | No context, fixed vocabulary |
+| Vocab action head + Qwen3-0.6B (frozen) | 0% | Sparse reward, DAgger oscillation |
+| Vocab action head + Qwen3-4B (frozen) | 0% | Same issues at larger scale |
+| LLM SFT (format warm-up) + GRPO 1500 steps | 0% | Model repeats generic words, ignores page context |
+| GRPO + DAgger soft oracle (IDF floor) | 0% | GRPO gradient dominates; oracle signal erased |
 
-| POC iteration | What changed | Reward trend | Cold-start failure |
-|---------------|-------------|--------------|-------------------|
-| Tabular RL (Q-table, 5k vocab) | Baseline: no LLM, fixed vocabulary | Flat ~2% solve | No page context at all |
-| SFT warm-up on oracle trajectories | Format learning: model outputs `MOT: word` correctly | Better format, no strategy | Learns format, not when/why to guess what |
-| SFT → GRPO (bandit, frozen snapshots) | Reward signal introduced; model starts adapting guesses | Reward slowly rising | Trained on turn-18 states, collapses at turn 0 |
-| + DAgger (oracle injection on bad turns) | Oracle rescues stuck games, provides positive examples | Small further gain | GRPO gradient dominates; oracle signal washed out |
-| + Reward reshaping (IDF weighting, near-solve shaping) | Denser gradient; less farming of generic words | Reward visibly improving | Still 0% solve on cold-start eval — distribution mismatch unresolved |
+Core failure mode: the model learned a fixed set of ~10 generic French words ("egalement", "premier", "europe") that get slightly positive reward on most pages, and never adapted to page-specific content. The reward signal (title hit = +200) fires less than 1% of games — not enough for GRPO to learn strategy from scratch.
 
-The persistent failure mode: the model learned a fixed set of ~10 generic French words ("egalement", "premier", "europe") that score slightly positive on almost any page, and never adapted to page-specific content. Each reward tweak pushed the training curve up a few points but the cold-start distribution mismatch — training on mid-game oracle states while evaluating from turn 0 — meant improvements never transferred to eval.
+Reward engineering applied along the way:
+- IDF-weighted exact/semantic hit scoring
+- NON_WORD_REWARD (−200) to block garbage token exploitation
+- Semantic shaping weight reduced (0.05 → 0.01) to prevent generic-word farming
+- **Near-solve shaping** (new): dense bonus proportional to proximity to any unrevealed title word — gives gradient even without solving
 
 ### Next: Claude strategy distillation
 
