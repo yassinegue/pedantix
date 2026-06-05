@@ -16,6 +16,7 @@ from .dataset import (
     save_pages,
 )
 from .claude_agent import generate_claude_sft_data, run_claude_eval
+from .do_agent import generate_do_trajectories
 from .llm_policy import (
     DEFAULT_LLM_MODEL,
     build_llm_curriculum,
@@ -25,7 +26,13 @@ from .llm_policy import (
     train_llm_grpo,
     train_llm_sft,
 )
-from .model import TinyPedantixModel, train_tiny_model
+from .model import (
+    FastTextWikiModel,
+    TinyPedantixModel,
+    build_fasttext_wiki_model,
+    download_fasttext_french,
+    train_tiny_model,
+)
 from .rl import GRPOLogEntry, RLPolicy, solve_with_policy, train_grpo_policy, train_rl_policy
 from .simulator import PedantixGame
 from .solver import solve_page
@@ -300,6 +307,13 @@ def cmd_llm_sft(args: argparse.Namespace) -> None:
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
         resume_from_checkpoint=args.resume_from_checkpoint,
+        score_min=getattr(args, "score_min", 0),
+        score_weighted=getattr(args, "score_weighted", False),
+        semantic_smoothing=getattr(args, "semantic_smoothing", False),
+        semantic_smoothing_alpha=getattr(args, "semantic_smoothing_alpha", 0.3),
+        fasttext_model_path=getattr(args, "fasttext_model", None),
+        stop_on_garbage=not getattr(args, "no_stop_on_garbage", False),
+        max_seq_length=getattr(args, "max_seq_length", 1280),
     )
     print(f"saved SFT adapter/model -> {args.output_dir}")
 
@@ -346,8 +360,60 @@ def cmd_llm_grpo(args: argparse.Namespace) -> None:
         dagger_oracle_top_k=args.dagger_oracle_top_k,
         dagger_oracle_temperature=args.dagger_oracle_temperature,
         dagger_oracle_min_idf=args.dagger_oracle_min_idf,
+        stop_on_garbage=not args.no_stop_on_garbage,
+        use_constrained_decoding=getattr(args, "constrained", False),
     )
     print(f"saved GRPO adapter/model -> {args.output_dir}")
+
+
+def cmd_llm_grpo_trajectory(args: argparse.Namespace) -> None:
+    from pedantix_project.trajectory_grpo import (
+        TrajectoryGRPOArgs,
+        train_llm_grpo_trajectory,
+    )
+    cfg = TrajectoryGRPOArgs(
+        pages_jsonl=args.pages,
+        model_name_or_path=args.model,
+        tiny_model_path=args.tiny_model,
+        output_dir=args.output_dir,
+        max_steps=args.max_steps,
+        batch_size=args.batch_size,
+        num_generations=args.num_generations,
+        micro_batch_size=args.micro_batch_size,
+        max_completion_length=args.max_completion_length,
+        learning_rate=args.learning_rate,
+        beta=args.beta,
+        pool_size=args.pool_size,
+        game_max_steps=args.game_max_steps,
+        seed=args.seed,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        lora_rank=args.lora_rank,
+        solve_bonus_scale=args.solve_bonus_scale,
+        top_k_pages=args.top_k_pages,
+        min_intro_chars=args.min_intro_chars,
+        log_path=args.log,
+        plot_path=args.plot,
+        logging_steps=args.logging_steps,
+        save_steps=args.save_steps,
+        eval_pages_path=args.eval_corpus,
+        eval_every_n_steps=args.eval_every,
+        eval_pages=args.eval_pages,
+        eval_max_game_steps=args.eval_max_game_steps,
+        eval_chat_format=args.eval_chat_format,
+        eval_num_generations=args.eval_num_generations,
+        eval_batch_size=args.eval_batch_size,
+        chat_format=args.chat_format,
+        contrastive_weight=args.contrastive_weight,
+        kl_alarm_threshold=args.kl_alarm_threshold,
+        kl_lr_cut_factor=args.kl_lr_cut_factor,
+        seed_turns=args.seed_turns,
+        max_seed_turns=args.max_seed_turns,
+        curriculum=args.curriculum,
+        dagger_rescue_threshold=args.dagger_rescue_threshold,
+    )
+    train_llm_grpo_trajectory(cfg)
+    print(f"saved trajectory GRPO adapter -> {args.output_dir}")
 
 
 def cmd_claude_eval(args: argparse.Namespace) -> None:
@@ -390,6 +456,67 @@ def cmd_claude_sft_gen(args: argparse.Namespace) -> None:
     print(f"wrote {n} training examples to {args.output}")
 
 
+def cmd_do_traj_gen(args: argparse.Namespace) -> None:
+    import os
+    provider = args.provider
+    _env_key = {
+        "do": "DO_INFERENCE_KEY",
+        "groq": "GROQ_API_KEY",
+        "cerebras": "CEREBRAS_API_KEY",
+        "fireworks": "FIREWORKS_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "cloudflare": "CF_API_TOKEN",
+    }
+    api_key = args.api_key or os.environ.get(_env_key.get(provider, "DO_INFERENCE_KEY"), "")
+    if not api_key:
+        raise ValueError(f"Provide --api-key or set {_env_key.get(provider)} env var")
+    cf_account_id = getattr(args, "cf_account_id", None) or os.environ.get("CF_ACCOUNT_ID", "")
+    sim = TinyPedantixModel.load(args.tiny_model)
+    signal_model = None
+    if args.signal_model and Path(args.signal_model).exists():
+        print(f"Loading signal model: {args.signal_model}")
+        signal_model = FastTextWikiModel.load(args.signal_model)
+        print(f"  {len(signal_model.word2idx):,} word vectors loaded")
+    elif args.signal_model:
+        print(f"Warning: signal model not found at {args.signal_model}, using TinyModel")
+    schedule = [int(x) for x in args.warm_start_schedule.split(",")]
+    n = generate_do_trajectories(
+        pages_path=args.pages,
+        sim_model=sim,
+        api_key=api_key,
+        model=args.do_model,
+        n_pages=args.n_pages,
+        max_steps=args.max_steps,
+        out_jsonl=args.output,
+        seed=args.seed,
+        warm_start_schedule=schedule,
+        signal_model=signal_model,
+        workers=args.workers,
+        request_delay=args.request_delay,
+        provider=provider,
+        cf_account_id=cf_account_id,
+        enable_cot=args.cot,
+        grpo_format=getattr(args, "grpo_format", False),
+        verbose=True,
+    )
+    print(f"wrote {n} training examples to {args.output}")
+
+
+def cmd_fasttext_download(args: argparse.Namespace) -> None:
+    download_fasttext_french(dest_dir=args.dest_dir, verbose=True)
+
+
+def cmd_fasttext_build(args: argparse.Namespace) -> None:
+    model = build_fasttext_wiki_model(
+        pages_path=args.pages,
+        fasttext_vec_gz=args.vec_gz,
+        output_path=args.output,
+        max_vocab=args.max_vocab,
+        verbose=True,
+    )
+    print(f"Built FastTextWikiModel with {len(model.word2idx):,} words → {args.output}")
+
+
 def cmd_llm_eval(args: argparse.Namespace) -> None:
     model = TinyPedantixModel.load(args.tiny_model)
     result = evaluate_llm_policy(
@@ -403,6 +530,7 @@ def cmd_llm_eval(args: argparse.Namespace) -> None:
         chat_format=args.chat_format,
         generation_batch_size=args.eval_batch_size,
         eval_num_generations=args.eval_num_generations,
+        constrained=getattr(args, "constrained", False),
     )
     print(json.dumps(result, ensure_ascii=False))
 
@@ -618,7 +746,7 @@ def build_parser() -> argparse.ArgumentParser:
                          help="path to held-out pages JSONL; required when --eval-every>0")
     llm_sft.add_argument("--eval-max-game-steps", type=int, default=30,
                          help="max guesses per eval game")
-    llm_sft.add_argument("--eval-chat-format", choices=["none", "qwen"], default="qwen")
+    llm_sft.add_argument("--eval-chat-format", choices=["none", "qwen", "qwen-think"], default="qwen")
     llm_sft.add_argument("--eval-num-generations", type=int, default=4)
     llm_sft.add_argument("--eval-batch-size", type=int, default=8)
     llm_sft.add_argument("--save-steps", type=int, default=None,
@@ -627,6 +755,23 @@ def build_parser() -> argparse.ArgumentParser:
                          help="max number of checkpoints kept on disk")
     llm_sft.add_argument("--resume-from-checkpoint", default=None,
                          help="path to a checkpoint dir, or pass 'auto' / 'latest' to auto-resume from --output-dir")
+    llm_sft.add_argument("--score-min", type=int, default=0,
+                         help="drop training examples whose score field is below this threshold (0 = keep all)")
+    llm_sft.add_argument("--score-weighted", action="store_true",
+                         help="weight per-example loss by score/100; requires 'score' field in training JSONL")
+    llm_sft.add_argument("--semantic-smoothing", action="store_true",
+                         help="replace hard CE with embedding-similarity soft labels (RAML-style). "
+                              "Pass --fasttext-model for proper cosine neighbors, or --tiny-model as fallback.")
+    llm_sft.add_argument("--semantic-smoothing-alpha", type=float, default=0.3,
+                         help="smoothing strength: fraction of loss mass placed on semantic neighbors (default 0.3)")
+    llm_sft.add_argument("--fasttext-model", default=None,
+                         help="path to FastTextWikiModel .npz file (e.g. models/fasttext_wiki_model.npz); "
+                              "used for semantic smoothing neighbors — much better than TinyModel")
+    llm_sft.add_argument("--no-stop-on-garbage", action="store_true", default=False,
+                         help="disable early stopping when eval detects template memorization/garbage output")
+    llm_sft.add_argument("--max-seq-length", type=int, default=1280,
+                         help="max token length per training example (prompt+completion); "
+                              "reduce to save GPU memory (default 1280)")
     llm_sft.set_defaults(func=cmd_llm_sft)
 
     llm_grpo = sub.add_parser("llm-grpo", help="LoRA GRPO/RLVR training with simulator rewards")
@@ -686,7 +831,79 @@ def build_parser() -> argparse.ArgumentParser:
                           help="for soft oracle: softmax temperature over top-K rewards (0 = argmax)")
     llm_grpo.add_argument("--dagger-oracle-min-idf", type=float, default=0.0,
                           help="for soft oracle: drop candidate words with IDF below this floor")
+    llm_grpo.add_argument("--no-stop-on-garbage", action="store_true", default=False,
+                          help="disable early stopping when GARBAGE is detected at eval")
+    llm_grpo.add_argument("--constrained", action="store_true", default=False,
+                          help="enable trie-based constrained decoding during GRPO rollouts (eliminates garbage generations)")
     llm_grpo.set_defaults(func=cmd_llm_grpo)
+
+    llm_traj = sub.add_parser(
+        "llm-grpo-trajectory",
+        help="trajectory GRPO: model plays full games from turn 0, updates on its own rollouts",
+    )
+    llm_traj.add_argument("--pages", default="data/filtered_pages.jsonl",
+                          help="JSONL of (title, intro) pages — pool to sample games from")
+    llm_traj.add_argument("--model", default=DEFAULT_LLM_MODEL,
+                          help="base model name or LoRA adapter dir (e.g. models/v7_oracle_sft)")
+    llm_traj.add_argument("--tiny-model", default="models/tiny_model.json")
+    llm_traj.add_argument("--output-dir", default="models/v7_grpo_traj")
+    llm_traj.add_argument("--log", default=None,
+                          help="path to per-step training log JSONL (default: output_dir/training_log.jsonl)")
+    llm_traj.add_argument("--plot", default=None)
+    llm_traj.add_argument("--max-steps", type=int, default=3000)
+    llm_traj.add_argument("--batch-size", type=int, default=4,
+                          help="number of live games sampled and advanced per step")
+    llm_traj.add_argument("--num-generations", type=int, default=4,
+                          help="GRPO group size — completions per game per step")
+    llm_traj.add_argument("--micro-batch-size", type=int, default=None,
+                          help="chunk policy+ref fwd/bwd into micro-batches of this size; "
+                               "gradients accumulate across chunks. None = full B*G in one shot.")
+    llm_traj.add_argument("--max-completion-length", type=int, default=8)
+    llm_traj.add_argument("--learning-rate", type=float, default=1e-6)
+    llm_traj.add_argument("--beta", type=float, default=0.05,
+                          help="KL coefficient (lower = more exploration)")
+    llm_traj.add_argument("--pool-size", type=int, default=64,
+                          help="number of live games kept in the rollout buffer")
+    llm_traj.add_argument("--game-max-steps", type=int, default=30,
+                          help="max turns per Pedantix game before reset")
+    llm_traj.add_argument("--seed", type=int, default=42)
+    llm_traj.add_argument("--temperature", type=float, default=0.9)
+    llm_traj.add_argument("--top-p", type=float, default=0.9)
+    llm_traj.add_argument("--lora-rank", type=int, default=32)
+    llm_traj.add_argument("--solve-bonus-scale", type=float, default=1.0,
+                          help="multiplier on SOLVED_TITLE_REWARD (1.0 = full)")
+    llm_traj.add_argument("--contrastive-weight", type=float, default=0.0,
+                          help="per-batch contrastive penalty weight (0=disabled, backfired in v8)")
+    llm_traj.add_argument("--kl-alarm-threshold", type=float, default=50.0,
+                          help="KL value that triggers rollback+LR cut (0=disabled)")
+    llm_traj.add_argument("--kl-lr-cut-factor", type=float, default=0.5,
+                          help="multiply LR by this on KL alarm")
+    llm_traj.add_argument("--top-k-pages", type=int, default=20000,
+                          help="restrict pool to top-K most popular pages")
+    llm_traj.add_argument("--min-intro-chars", type=int, default=300)
+    llm_traj.add_argument("--logging-steps", type=int, default=1)
+    llm_traj.add_argument("--save-steps", type=int, default=100)
+    llm_traj.add_argument("--eval-corpus", default="data/clean_pages.jsonl")
+    llm_traj.add_argument("--eval-every", type=int, default=50,
+                          help="held-out eval cadence (per CLAUDE.md: 50 by default)")
+    llm_traj.add_argument("--eval-pages", type=int, default=20)
+    llm_traj.add_argument("--eval-max-game-steps", type=int, default=30)
+    llm_traj.add_argument("--eval-chat-format", choices=["none", "qwen", "qwen-think"], default="qwen")
+    llm_traj.add_argument("--eval-num-generations", type=int, default=2)
+    llm_traj.add_argument("--eval-batch-size", type=int, default=2)
+    llm_traj.add_argument("--chat-format", choices=["none", "qwen", "qwen-think"], default="qwen")
+    llm_traj.add_argument("--seed-turns", type=int, default=0,
+                          help="Pre-play N turns per game with intro-word oracle before GRPO takes over")
+    llm_traj.add_argument("--max-seed-turns", type=int, default=None,
+                          help="If set, each game draws seed turns uniformly from [0, max-seed-turns] "
+                               "instead of the fixed --seed-turns value")
+    llm_traj.add_argument("--curriculum", action="store_true", default=False,
+                          help="Bias page sampling toward learnable pages (reward EMA in [-80, +20])")
+    llm_traj.add_argument("--dagger-rescue-threshold", type=int, default=None,
+                          help="If set, when a game has N consecutive negative-reward turns, "
+                               "inject a FastText-similar-to-title oracle word as one of the G "
+                               "generations. Recommended: 3.")
+    llm_traj.set_defaults(func=cmd_llm_grpo_trajectory)
 
     llm_eval = sub.add_parser("llm-eval", help="play local Pedantix games with a trained LLM policy")
     llm_eval.add_argument("--pages", default="data/clean_pages.jsonl")
@@ -695,10 +912,12 @@ def build_parser() -> argparse.ArgumentParser:
     llm_eval.add_argument("--sample-pages", type=int, default=20)
     llm_eval.add_argument("--max-game-steps", type=int, default=100)
     llm_eval.add_argument("--output", default="models/llm_eval.jsonl")
-    llm_eval.add_argument("--chat-format", choices=["none", "qwen"], default="qwen")
+    llm_eval.add_argument("--chat-format", choices=["none", "qwen", "qwen-think"], default="qwen")
     llm_eval.add_argument("--eval-batch-size", type=int, default=16)
     llm_eval.add_argument("--eval-num-generations", type=int, default=8)
     llm_eval.add_argument("--seed", type=int, default=7)
+    llm_eval.add_argument("--constrained", action="store_true", default=False,
+                          help="restrict generation to valid French words via trie-based constrained decoding")
     llm_eval.set_defaults(func=cmd_llm_eval)
 
     llm_vocab_grpo = sub.add_parser("llm-vocab-grpo", help="LoRA GRPO over a fixed French word action vocabulary")
@@ -797,6 +1016,56 @@ def build_parser() -> argparse.ArgumentParser:
     claude_sft_gen.add_argument("--api-key", default="", help="Anthropic API key (or set ANTHROPIC_API_KEY)")
     claude_sft_gen.add_argument("--seed", type=int, default=42)
     claude_sft_gen.set_defaults(func=cmd_claude_sft_gen)
+
+    do_traj = sub.add_parser(
+        "do-traj-gen",
+        help="generate comprehensive SFT trajectories via DigitalOcean serverless inference (OpenAI-compatible)",
+    )
+    do_traj.add_argument("--pages", default="data/clean_pages.jsonl")
+    do_traj.add_argument("--tiny-model", default="models/tiny_model.json")
+    do_traj.add_argument("--n-pages", type=int, default=1000)
+    do_traj.add_argument("--max-steps", type=int, default=30)
+    do_traj.add_argument("--output", default="data/do_trajectories.jsonl")
+    do_traj.add_argument("--do-model", default="llama3.3-70b-instruct", help="DigitalOcean model ID")
+    do_traj.add_argument("--api-key", default="", help="DO inference key (or set DO_INFERENCE_KEY)")
+    do_traj.add_argument("--seed", type=int, default=42)
+    do_traj.add_argument(
+        "--warm-start-schedule",
+        default="5,10,10,15,20",
+        help="comma-separated list of oracle warm-start steps to cycle through (e.g. '5,10,10,15,20')",
+    )
+    do_traj.add_argument(
+        "--signal-model",
+        default="models/fasttext_wiki_model.npz",
+        help="path to FastTextWikiModel for richer 0-100 signal (optional, falls back to TinyModel)",
+    )
+    do_traj.add_argument("--workers", type=int, default=1,
+                         help="Parallel games (default: 1)")
+    do_traj.add_argument("--request-delay", type=float, default=0.2,
+                         help="Seconds to sleep between LLM calls (default: 0.2)")
+    do_traj.add_argument("--provider", choices=["do", "groq", "cerebras", "fireworks", "anthropic", "cloudflare"], default="do",
+                         help="Inference provider (default: do)")
+    do_traj.add_argument("--cf-account-id", default="",
+                         help="Cloudflare account ID (required when --provider cloudflare)")
+    do_traj.add_argument("--cot", action="store_true", default=False,
+                         help="Enable chain-of-thought: model reasons in <think>...</think> before each guess")
+    do_traj.add_argument("--grpo-format", action="store_true", default=False,
+                         help="Include title/intro/history columns and qwen-chat-formatted prompts for direct GRPO use")
+    do_traj.set_defaults(func=cmd_do_traj_gen)
+
+    ft_dl = sub.add_parser("fasttext-download", help="download FastText cc.fr.300.vec.gz (~1.6 GB)")
+    ft_dl.add_argument("--dest-dir", default="models/fasttext", help="directory to save the file")
+    ft_dl.set_defaults(func=cmd_fasttext_download)
+
+    ft_build = sub.add_parser(
+        "fasttext-build",
+        help="filter cc.fr.300.vec.gz to Wikipedia vocab and save compact model",
+    )
+    ft_build.add_argument("--pages", default="data/clean_pages.jsonl")
+    ft_build.add_argument("--vec-gz", default="models/fasttext/cc.fr.300.vec.gz")
+    ft_build.add_argument("--output", default="models/fasttext_wiki_model.npz")
+    ft_build.add_argument("--max-vocab", type=int, default=None, help="cap on vocab size (default: no cap, exhaustive)")
+    ft_build.set_defaults(func=cmd_fasttext_build)
 
     return parser
 

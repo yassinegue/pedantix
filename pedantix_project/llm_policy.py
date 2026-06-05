@@ -27,7 +27,7 @@ NON_WORD_REWARD = -200.0  # not in French dictionary AND not in current page (ki
 NO_INFORMATION_REWARD = -30.0
 NON_SOLVE_STEP_REWARD = -10.0
 SOLVED_TITLE_REWARD = 1000.0
-SEMANTIC_SHAPING_WEIGHT = 0.01  # was 0.05 — lowered to weaken the "spam common content words" reward hack
+SEMANTIC_SHAPING_WEIGHT = 0.5  # full reward for IDF-weighted body hits (IDF already suppresses le/la)
 NEAR_SOLVE_SHAPING_COEF = 0.3  # dense gradient: bonus proportional to proximity to any unrevealed title word
 LETTER_WORD_PATTERN = r"[^\W\d_](?:[^\W\d_]|['’-])*"
 GUESS_RE = re.compile(rf"(?:^|\b)(?:MOT|WORD)\s*:\s*({LETTER_WORD_PATTERN})", re.IGNORECASE | re.UNICODE)
@@ -139,6 +139,10 @@ def load_hf_token_from_env_files() -> None:
 
 
 def extract_guess(completion: str) -> str:
+    # Unclosed <think> block = model ran out of tokens mid-reasoning.
+    # Don't parse the partial trace as a word — return empty to trigger fallback.
+    if re.search(r"<think>", completion, re.IGNORECASE) and not re.search(r"</think>", completion, re.IGNORECASE):
+        return ""
     completion = strip_qwen_thinking(completion)
     match = GUESS_RE.search(completion.strip())
     raw = match.group(1) if match else ""
@@ -165,43 +169,169 @@ def is_valid_guess(guess: str) -> bool:
     )
 
 
-def make_prompt(history: list[dict], *, max_steps: int, visible_text: str | None = None) -> str:
-    lines = [
-        "Jeu: Pedantix francais. Propose un seul mot francais informatif.",
-        "Ecris seulement le mot choisi apres le prefixe MOT:.",
-        "Ne pense pas. N'ecris aucune explication, aucun raisonnement, aucune balise think.",
-        "Interdit: repetition, cache, page, pedantix, jeu, explication, think, reasoning.",
-        "Prefere des themes larges puis adapte-toi au texte visible.",
-        "Objectif prioritaire: trouver le titre exact de la page.",
-        f"Essais maximum dans cette partie: {max_steps}.",
-        "",
-    ]
-    if not history:
-        lines.extend(
-            [
-                "Historique: aucun.",
-                "Choisis un theme general, pas un mot rare.",
-            ]
+_COLD_START_DOMAINS = (
+    "sport, guerre, science, musique, cinema, art, nature, economie, "
+    "religion, architecture, biologie, geographie, litterature, politique"
+)
+
+
+def _score_label(score: int, exact: int) -> str:
+    """Map a 0-100 similarity score to a human-readable label."""
+    if exact > 0:
+        return f"VERT (exact, {exact} mot(s) revele(s))"
+    if score >= 60:
+        return f"ORANGE {score}/100 (domaine tres proche, affine!)"
+    if score >= 30:
+        return f"JAUNE {score}/100 (domaine approche, continue)"
+    return f"ROUGE {score}/100 (mauvais domaine, change)"
+
+
+def compute_page_max_sim(
+    game: "PedantixGame",
+    guess: str,
+    signal_model=None,
+) -> int:
+    """Return the max cosine similarity (0-100) between guess and any page word.
+
+    signal_model: optional richer model (e.g. FastTextWikiModel) to use instead
+    of game.similarity_model for the signal. Falls back to game.similarity_model.
+    """
+    from .text import canonical_word as _canon
+
+    model = signal_model if signal_model is not None else game.similarity_model
+    if model is None:
+        return 0
+    canon = _canon(guess)
+    page_canons = {tok.canon for tok in game.tokens if tok.is_word}
+
+    # FastTextWikiModel: use vectorised max_sim_to_words if available
+    if hasattr(model, "max_sim_to_words"):
+        best = model.max_sim_to_words(canon, page_canons)
+        return round(best * 100)
+
+    # TinyPedantixModel: neighbor dict fast-path
+    neighbors = getattr(model, "neighbors", {})
+    guess_neighbors = neighbors.get(canon, {})
+    if not guess_neighbors:
+        best = max(
+            (neighbors.get(pc, {}).get(canon, 0.0) for pc in page_canons),
+            default=0.0,
         )
     else:
-        lines.append("Historique des feedbacks:")
-        for idx, step in enumerate(history, 1):
-            lines.append(
-                f"{idx}. mot={step['guess']} exact={step['exact']} proche={step['semantic']} "
-                f"titre={step['title']} solved={step['solved']}"
+        best = max((guess_neighbors.get(pc, 0.0) for pc in page_canons), default=0.0)
+        if best == 0.0:
+            best = max(
+                (neighbors.get(pc, {}).get(canon, 0.0) for pc in page_canons),
+                default=0.0,
             )
-        guessed = ", ".join(step["guess"] for step in history[-12:])
-        lines.append(f"Mots deja joues recemment: {guessed}")
+    if canon in page_canons:
+        best = max(best, 1.0)
+    return round(best * 100)
+
+
+def _detect_partial_words(visible_text: str) -> list[str]:
+    """Find compound word stubs like 'États-_(4)' or 'Saint-_(5)' in visible text.
+    Returns hints like ['États- → probablement Unis (4 lettres)'].
+    """
+    import re
+    hints = []
+    for m in re.finditer(r"([A-ZÀ-Ü][a-zà-ü]+-)\(?_\((\d+)\)", visible_text):
+        stub, n = m.group(1), int(m.group(2))
+        known = {
+            "États-": "unis", "Saint-": None, "Nord-": None, "Sud-": None,
+            "Ouest-": None, "Est-": None, "Grande-": None, "Nouvelle-": None,
+        }
+        if stub in known and known[stub]:
+            hints.append(f"  '{stub}_({n})' visible → devine '{known[stub]}' immediatement!")
+        else:
+            hints.append(f"  '{stub}_({n})' visible → devine la suite de ce mot compose ({n} lettres)!")
+    return hints
+
+
+def _score_trend_hint(history: list[dict]) -> str | None:
+    """Return a strategy nudge based on recent score trend."""
+    if len(history) < 3:
+        return None
+    recent = [s.get("score", 0) for s in history[-4:] if not s.get("exact")]
+    if not recent:
+        return None
+    best_ever = max(s.get("score", 0) for s in history if not s.get("exact", 0))
+    recent_avg = sum(recent) / len(recent)
+    # Stuck low: recent scores all below 45, best was also low
+    if recent_avg < 45 and best_ever < 55:
+        return "PIVOT: tes scores restent bas. Change completement de domaine (essaie: sport, science, geographie, art, cinema, musique, politique...)."
+    # Was high, now dropped
+    if best_ever >= 60 and recent_avg < best_ever - 20:
+        return f"ATTENTION: tu etais a {best_ever}/100 mais tu t'eloignes. Reviens vers le domaine de ton meilleur score."
+    # Plateau in orange: narrow down
+    if recent_avg >= 55:
+        return "Tu es CHAUD (score eleve). Affine: devine des mots plus specifiques, pas generiques."
+    return None
+
+
+def make_prompt(history: list[dict], *, max_steps: int, visible_text: str | None = None) -> str:
+    """Build the prompt shown to the LLM agent at each step.
+
+    visible_text should come from full_visible_text(game) for the DO/Claude agent,
+    or compact_visible_text(game) for the Qwen3-4B training loop.
+    """
+    lines = [
+        "Tu joues a Pedantix: devine le titre d'un article Wikipedia francais mot par mot.",
+        "Regles:",
+        "  - Propose UN seul mot francais a la fois (minuscules).",
+        "  - Le titre et le texte sont masques: chaque mot cache est montre comme ?(N) ou _(N) ou N est le nombre de lettres.",
+        "  - Les ?(N) dans la ligne TITRE sont les mots du titre qu'il faut deviner.",
+        "  - VERT = mot exact trouve et revele dans le texte.",
+        "  - score/100 = similarite avec le mot le plus proche de la page:",
+        "      ROUGE  0-29: mauvais domaine",
+        "      JAUNE 30-59: domaine approche",
+        "      ORANGE 60+:  tres proche, affine",
+        "",
+        "Strategie:",
+        "  - Le titre peut etre EN ANGLAIS (ex: 'Target', 'Facebook', 'Inception') ou un nom propre etranger: essaie des mots anglais si le contexte le suggere.",
+        "  - Le titre peut etre un film, une serie, une chanson, une marque, un pays, une personne — pas forcement un concept francais.",
+        "  - Si tu vois 'Mot-_(N)' dans le texte (ex: 'États-_(4)'), devine IMMEDIATEMENT la suite du mot compose.",
+        "  - Si tes 3 derniers scores baissent ou stagnent sous 45, CHANGE de domaine completement.",
+        "  - Si un score monte vers 60+, affine avec des mots plus specifiques au lieu de rester generique.",
+        "",
+        f"Essais restants: {max_steps - len(history)}/{max_steps}.",
+        "",
+    ]
     if visible_text:
         lines.extend(
             [
-                "",
-                "Texte visible:",
+                "PAGE (mots caches = longueur entre parentheses):",
                 visible_text,
+                "",
             ]
         )
+        partial_hints = _detect_partial_words(visible_text)
+        if partial_hints:
+            lines.append("INDICES VISIBLES dans le texte:")
+            lines.extend(partial_hints)
+            lines.append("")
+
+    if not history:
+        lines.extend(
+            [
+                "Aucun indice encore. Commence par explorer des domaines varies:",
+                f"  {_COLD_START_DOMAINS}",
+            ]
+        )
+    else:
+        lines.append("Historique des essais:")
+        for idx, step in enumerate(history, 1):
+            score = step.get("score", 0)
+            label = _score_label(score, step["exact"])
+            lines.append(f"  {idx:2d}. {step['guess']:20s} -> {label}")
+        guessed_all = ", ".join(step["guess"] for step in history)
+        lines.append(f"\nMots INTERDITS (NE PAS REPETER): {guessed_all}")
+        trend = _score_trend_hint(history)
+        if trend:
+            lines.append(f"\n⚡ {trend}")
+        lines.append("=> Choisis un mot NOUVEAU.")
     lines.append("")
-    lines.append("Reponse:")
+    lines.append("MOT:")
     return "\n".join(lines)
 
 
@@ -210,6 +340,10 @@ def format_prompt_for_model(prompt: str, chat_format: str = "none") -> str:
         return prompt
     if chat_format == "qwen":
         return f"<|im_start|>user\n{prompt}\n/no_think<|im_end|>\n<|im_start|>assistant\nMOT:"
+    if chat_format == "qwen-think":
+        # CoT distillation format: matches the DeepSeek SFT data structure.
+        # No /no_think, no MOT: prefix — model generates <think>...</think>\nMOT: word
+        return f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
     raise ValueError(f"unsupported chat_format={chat_format!r}")
 
 
@@ -240,6 +374,7 @@ def _apply_llm_exact_reveals(game: PedantixGame, guess: str) -> set[int]:
 
 
 def compact_visible_text(game: PedantixGame, *, max_chars: int = 240) -> str:
+    """Legacy compact view used by the Qwen3-4B training loop (512-token budget)."""
     parts: list[str] = []
     hidden = False
     for idx, tok in enumerate(game.tokens):
@@ -260,6 +395,45 @@ def compact_visible_text(game: PedantixGame, *, max_chars: int = 240) -> str:
     head = text[: max_chars // 2].rsplit(" ", 1)[0]
     tail = text[-max_chars // 2 :].split(" ", 1)[-1]
     return f"{head}\n[...]\n{tail}".strip()
+
+
+def full_visible_text(game: PedantixGame) -> str:
+    """Full page view for the LLM agent: every hidden word shown as _(N) with its length.
+
+    The title line is rendered first (always), then the article body.
+    Hidden title words are shown as ?(N) to highlight that they are the goal.
+    Hidden body words are shown as _(N).
+    Revealed words are shown as-is.
+    Numbers and punctuation are always visible.
+
+    Example title line:  "?(8) du monde de ?(9) 1991"
+    Example body:        "La ?(9) est _(8) de 11 _(6) ..."
+    """
+    title_parts: list[str] = []
+    body_parts: list[str] = []
+    in_title_section = True
+
+    for idx, tok in enumerate(game.tokens):
+        # Split at the \n\n separator between title and body
+        if tok.text == "\n\n":
+            in_title_section = False
+            continue
+
+        if not tok.is_word:
+            (title_parts if in_title_section else body_parts).append(tok.text)
+        elif idx in game.revealed:
+            (title_parts if in_title_section else body_parts).append(tok.text)
+        elif in_title_section:
+            # Title word not yet revealed — show length with ? to signal it's the goal
+            title_parts.append(f"?({len(tok.text)})")
+        else:
+            # Body word not yet revealed — show length
+            body_parts.append(f"_({len(tok.text)})")
+
+    title_line = re.sub(r"[ \t]+", " ", "".join(title_parts)).strip()
+    body_text = re.sub(r"[ \t]+", " ", "".join(body_parts)).strip()
+
+    return f"TITRE: {title_line}\n\n{body_text}"
 
 
 def score_completion(
@@ -285,6 +459,57 @@ def score_completion(
 
 
 _FRENCH_DICTIONARY_CACHE: dict[int, frozenset[str]] = {}
+_FULL_FRENCH_DICT_CACHE: frozenset[str] | None = None
+_FASTTEXT_EMBEDDER_CACHE: dict[str, object] = {}
+
+
+def _load_similarity_model(tiny_model_path: "str | Path") -> "TinyPedantixModel":
+    """Load FastTextWikiModel (with idf/starter_words from TinyModel) if NPZ is available.
+    Falls back to TinyPedantixModel on machines without the NPZ.
+    FastTextWikiModel is preferred: proper 300-dim cosine similarity over 495k French words,
+    vectorised max_sim_to_words for per-batch contrastive GRPO, and background_similarity
+    for global contrastive reward shaping."""
+    tiny = TinyPedantixModel.load(tiny_model_path)
+    npz_path = Path(tiny_model_path).parent / "fasttext_wiki_model.npz"
+    if npz_path.exists():
+        cache_key = str(npz_path)
+        if cache_key not in _FASTTEXT_EMBEDDER_CACHE:
+            from .model import FastTextWikiModel
+            print(f"[SimilarityModel] loading FastText from {npz_path} ...", flush=True)
+            ft = FastTextWikiModel.load(npz_path)
+            ft.idf = tiny.idf
+            ft.starter_words = tiny.starter_words
+            _FASTTEXT_EMBEDDER_CACHE[cache_key] = ft
+            print(f"[SimilarityModel] FastTextWikiModel ready ({len(ft.word2idx):,} words)", flush=True)
+        return _FASTTEXT_EMBEDDER_CACHE[cache_key]  # type: ignore[return-value]
+    print("[SimilarityModel] FastText NPZ not found, using TinyModel", flush=True)
+    return tiny
+
+
+def _full_french_dictionary() -> frozenset[str]:
+    """Load all lowercase alpha words from fr_FR.dic (accent-stripped). Cached."""
+    global _FULL_FRENCH_DICT_CACHE
+    if _FULL_FRENCH_DICT_CACHE is not None:
+        return _FULL_FRENCH_DICT_CACHE
+    import unicodedata as _ud
+
+    def _strip(s: str) -> str:
+        return "".join(c for c in _ud.normalize("NFD", s) if _ud.category(c) != "Mn")
+
+    words: set[str] = set()
+    dic_path = "/usr/share/myspell/fr_FR.dic"
+    try:
+        with open(dic_path, encoding="utf-8", errors="replace") as f:
+            next(f)
+            for line in f:
+                w = line.strip().split("/")[0].lower()
+                if w and w[0].islower() and all(c.isalpha() for c in w) and len(w) >= 2:
+                    words.add(w)
+                    words.add(_strip(w))
+    except OSError:
+        pass
+    _FULL_FRENCH_DICT_CACHE = frozenset(words)
+    return _FULL_FRENCH_DICT_CACHE
 
 
 def _french_dictionary(similarity_model: TinyPedantixModel | None) -> frozenset[str]:
@@ -316,13 +541,16 @@ def _french_dictionary(similarity_model: TinyPedantixModel | None) -> frozenset[
 
 
 def _is_real_french_word(guess: str, game: PedantixGame) -> bool:
-    """A guess is 'real' if it is in the similarity model's vocabulary OR appears
-    as a tokenized word in the current page. Page tokens are accepted because a
-    rare word in the page may be the very thing we want to guess."""
+    """A guess is 'real' if it is in the full French dictionary (fr_FR.dic), the
+    similarity model's vocabulary, OR appears as a tokenized word in the current
+    page. Full dictionary is checked first so rare-but-valid French words don't
+    get the -200 non-word penalty."""
     if not guess:
         return False
+    if guess in _full_french_dictionary():
+        return True
     if game.similarity_model is None:
-        return True  # no dictionary available, accept everything
+        return True
     if guess in _french_dictionary(game.similarity_model):
         return True
     for tok in game.tokens:
@@ -360,17 +588,24 @@ def score_guess_on_game(
     title_semantic_info = 0.0
     semantic_guess = canonical_word(guess)
     if game.similarity_model is not None:
+        # background_similarity: how similar is this word to the average Wikipedia
+        # article (corpus centroid). Subtracting it makes the reward contrastive —
+        # generic words (partie, grande, monde) get ~0 because they score equally
+        # well on every page; domain-specific words (chiropratique, kaltchyk) get
+        # large rewards only on the pages they actually belong to.
+        bg = getattr(game.similarity_model, "background_similarity", lambda w: 0.0)(semantic_guess)
         for idx, tok in enumerate(game.tokens):
             if not tok.is_word or idx in revealed_after:
                 continue
             sim = game.similarity_model.similarity(semantic_guess, tok.canon)
+            contrastive = max(0.0, sim - bg)
             if idx in game.title_word_indices:
-                if sim > 0:  # no threshold for title tokens — any similarity gives gradient
-                    title_semantic_info += _token_information(game.similarity_model, tok.canon) * sim
+                if contrastive > 0:
+                    title_semantic_info += _token_information(game.similarity_model, tok.canon) * contrastive
             else:
-                if sim >= game.semantic_threshold:
+                if contrastive >= game.semantic_threshold:
                     semantic_hits += 1
-                    semantic_info += _token_information(game.similarity_model, tok.canon) * sim
+                    semantic_info += _token_information(game.similarity_model, tok.canon) * contrastive
 
     title_hits = len(game.title_word_indices & revealed_after) - before_title_hits
     exact_hits = len(new_exact_indices)
@@ -684,7 +919,7 @@ def soft_oracle_guess(
     title_words = set(_title_norm_words(page))
 
     pool: set[str] = set()
-    for word in _page_probe_words(page, similarity_model, limit=80):
+    for word in _page_probe_words(page, similarity_model, limit=150):
         if word not in title_words:
             pool.add(word)
 
@@ -704,10 +939,8 @@ def soft_oracle_guess(
         if seen_neighbors >= neighbor_budget:
             break
 
-    for word in similarity_model.starter_words[:80]:
-        word = normalize_word(word)
-        if word and word not in title_words:
-            pool.add(word)
+    # No hardcoded starters: _page_probe_words already gives page-specific
+    # high-IDF words from the intro, which are strictly better as openers.
 
     scored: list[tuple[str, float]] = []
     for word in pool:
@@ -735,8 +968,17 @@ def soft_oracle_guess(
     if temperature <= 0 or len(top) == 1:
         word, score = top[0]
     else:
-        max_r = max(s for _, s in top)
-        weights = [math.exp((s - max_r) / max(temperature, 1e-6)) for _, s in top]
+        # Normalize rewards to [0,1] before applying temperature so that raw
+        # reward scale (which can span hundreds of points) doesn't collapse the
+        # distribution to argmax. After normalization, temperature=1.0 gives
+        # meaningful diversity across the top-K candidates.
+        rewards = [s for _, s in top]
+        lo, hi = min(rewards), max(rewards)
+        if hi > lo:
+            norm = [(s - lo) / (hi - lo) for s in rewards]
+        else:
+            norm = [1.0] * len(rewards)
+        weights = [math.exp(n / max(temperature, 1e-6)) for n in norm]
         word, score = rng.choices(top, weights=weights, k=1)[0]
 
     if return_score:
@@ -850,6 +1092,7 @@ def evaluate_llm_policy(
     chat_format: str = "none",
     generation_batch_size: int = 16,
     eval_num_generations: int = 8,
+    constrained: bool = False,
 ) -> dict:
     enforce_hf_cache()
     transformers, torch = _import_transformers()
@@ -870,6 +1113,7 @@ def evaluate_llm_policy(
         chat_format=chat_format,
         generation_batch_size=generation_batch_size,
         eval_num_generations=eval_num_generations,
+        constrained=constrained,
     )
 
 
@@ -887,6 +1131,7 @@ def _run_eval_games(
     chat_format: str = "none",
     generation_batch_size: int = 16,
     eval_num_generations: int = 8,
+    constrained: bool = False,
 ) -> dict:
     pages = sample_pages(pages_path, sample_size=sample_size, seed=seed)
     histories: list[list[dict]] = [[] for _ in pages]
@@ -896,6 +1141,7 @@ def _run_eval_games(
     generation_rejected_invalid = 0
     generation_rejected_repeated = 0
     generation_fallbacks = 0
+    constrained_vocab = None  # full fr_FR.dic — reward fn handles non-TinyModel words
 
     try:
         import torch as _torch
@@ -927,6 +1173,8 @@ def _run_eval_games(
                     device=device,
                     num_return_sequences=eval_num_generations,
                     generation_stats=generation_stats,
+                    constrained=constrained,
+                    constrained_vocab=constrained_vocab,
                 )
                 for stat in generation_stats:
                     generation_rejected_invalid += int(stat.get("rejected_invalid", 0))
@@ -1003,16 +1251,65 @@ def generate_next_words(
     device: str,
     num_return_sequences: int = 8,
     generation_stats: list[dict] | None = None,
+    constrained: bool = False,
+    constrained_dic: str | None = "/usr/share/myspell/fr_FR.dic",
+    constrained_tiny_model: str | None = None,
+    constrained_vocab: frozenset[str] | None = None,
 ) -> list[str]:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
-    generation_kwargs = _qwen_no_think_generation_kwargs(tokenizer, getattr(model.config, "name_or_path", ""))
+    model_name = getattr(model.config, "name_or_path", "")
+    # CoT (think) mode: prompt ends with <|im_start|>assistant\n (no /no_think, no MOT: prefix)
+    use_think = any("<|im_start|>assistant\n" in p and "/no_think" not in p and not p.rstrip().endswith("MOT:") for p in prompts)
+    if use_think:
+        generation_kwargs = {}
+        max_new_tokens = 512
+    else:
+        generation_kwargs = _qwen_no_think_generation_kwargs(tokenizer, model_name)
+        max_new_tokens = 8
     guessed_sets = [{str(step.get("guess", "")) for step in history or []} for history in histories]
-    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024,
+                       truncation_side="left").to(device)
+    prompt_length = inputs["input_ids"].shape[1]
+    if constrained and not use_think:
+        from pedantix_project.constrained_decoding import build_french_constraint
+        generation_kwargs["prefix_allowed_tokens_fn"] = build_french_constraint(
+            tokenizer, prompt_length,
+            dic_path=constrained_dic,
+            tiny_model_path=constrained_tiny_model,
+            extra_exclusions=STOPWORDS | INVALID_GUESSES,
+            allowed_vocab=constrained_vocab,
+        )
+    if not use_think and guessed_sets:
+        from transformers import LogitsProcessorList, LogitsProcessor as _LP
+        class _BanGuessedProcessor(_LP):
+            def __init__(self, banned_ids_per_prompt, n_seqs):
+                # expand: each prompt repeated n_seqs times in generate output
+                self._banned = [b for b in banned_ids_per_prompt for _ in range(n_seqs)]
+            def __call__(self, input_ids, scores):
+                for i, banned in enumerate(self._banned):
+                    if banned and i < scores.shape[0]:
+                        scores[i, list(banned)] = float('-inf')
+                return scores
+        banned_ids_per_prompt = []
+        for guessed in guessed_sets:
+            banned = set()
+            for word in guessed:
+                ids = tokenizer.encode(word, add_special_tokens=False)
+                if len(ids) == 1:
+                    banned.add(ids[0])
+                # also try with leading space (common for subword tokenizers)
+                ids2 = tokenizer.encode(" " + word, add_special_tokens=False)
+                if len(ids2) == 1:
+                    banned.add(ids2[0])
+            banned_ids_per_prompt.append(banned)
+        generation_kwargs["logits_processor"] = LogitsProcessorList(
+            [_BanGuessedProcessor(banned_ids_per_prompt, num_return_sequences)]
+        )
     output = model.generate(
         **inputs,
-        max_new_tokens=8,
+        max_new_tokens=max_new_tokens,
         do_sample=True,
         temperature=0.8,
         top_p=0.92,
@@ -1020,7 +1317,6 @@ def generate_next_words(
         pad_token_id=tokenizer.eos_token_id,
         **generation_kwargs,
     )
-    prompt_length = inputs["input_ids"].shape[1]
     choices: list[list[str]] = [[] for _ in prompts]
     rejected_invalid = [0 for _ in prompts]
     rejected_repeated = [0 for _ in prompts]
@@ -1107,6 +1403,293 @@ def _legacy_generate_next_word(model, tokenizer, prompt: str, *, history: list[d
     return extract_guess(tokenizer.decode(output[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True))
 
 
+class _ScoreAwareCollator:
+    """Wraps a base data collator and passes 'score_weight' through as a tensor."""
+
+    def __init__(self, base):
+        self._base = base
+
+    def __call__(self, features):
+        import torch
+        weights = [float(f.pop("score_weight", 1.0)) for f in features]
+        batch = self._base(features)
+        batch["score_weight"] = torch.tensor(weights, dtype=torch.float32)
+        return batch
+
+
+class _WordAwareCollator:
+    """Wraps a base data collator and passes 'target_word' through as a plain list of strings."""
+
+    def __init__(self, base):
+        self._base = base
+
+    def __call__(self, features):
+        words = [f.pop("target_word", "") for f in features]
+        batch = self._base(features)
+        batch["target_word"] = words
+        return batch
+
+
+def _make_score_weighted_trainer_cls(trl):
+    """Returns an SFTTrainer subclass with per-example reward-weighted loss."""
+    import torch
+    import torch.nn.functional as F
+
+    class _ScoreWeightedSFTTrainer(trl.SFTTrainer):
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+            weights = inputs.pop("score_weight", None)
+            if weights is None:
+                return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
+            outputs = model(**inputs)
+            logits = outputs.logits
+            labels = inputs.get("labels")
+            if labels is None:
+                loss = outputs.loss
+                if return_outputs:
+                    return loss, outputs
+                return loss
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            tok_loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                reduction="none",
+            ).view(shift_labels.shape)
+            mask = (shift_labels != -100).float()
+            per_ex = (tok_loss * mask).sum(-1) / mask.sum(-1).clamp(min=1)
+            w = weights.to(per_ex.device).float()
+            loss = (per_ex * w).sum() / w.sum().clamp(min=1e-9)
+            if return_outputs:
+                return loss, outputs
+            return loss
+
+    return _ScoreWeightedSFTTrainer
+
+
+class _SemanticSmoother:
+    """Semantic soft labels for the first-subword position of each target word.
+
+    Key idea (first-token approximation from Lukasik et al. 2020 + RAML):
+    - The "which word" decision is made at the first subword token.
+    - For target "guerre" = [' gu', 'erre']: at the ' gu' position we distribute
+      probability mass over the first subwords of semantically close words (e.g. the
+      first token of "bataille", "combat", "conflit" ...).
+    - At continuation positions ('erre') and EOS: hard CE — the continuation is
+      deterministic given the first subword, so no semantic smoothing needed.
+    - Works for both single-token words (e.g. "pays") and multi-token words (e.g. "guerre").
+
+    Requires the target word string to be passed alongside the token id — stored in
+    the dataset as "target_word" and plumbed through the collator.
+    """
+
+    def __init__(
+        self,
+        sim_model,          # FastTextWikiModel (preferred) or TinyPedantixModel (fallback)
+        tokenizer,
+        alpha: float = 0.3,
+        top_k: int = 20,
+    ) -> None:
+        from .model import FastTextWikiModel as _FTModel
+
+        self.alpha = alpha
+        self._top_k = top_k
+        self._tokenizer = tokenizer
+        # cache: (word, first_token_id) -> soft distribution or None
+        self._cache: dict[tuple, dict[int, float] | None] = {}
+        # word -> first subword token id (space-prefixed form preferred)
+        self._first_tok_cache: dict[str, int | None] = {}
+
+        if isinstance(sim_model, _FTModel):
+            self._ft = sim_model
+            self._tiny = None
+            self._idx2word: list[str] = sim_model.vocabulary
+            print(
+                f"[SemanticSmoother] FastText mode | alpha={alpha:.2f} | top_k={top_k} | "
+                f"{len(sim_model.word2idx):,} vectors",
+                flush=True,
+            )
+        else:
+            self._ft = None
+            self._tiny = sim_model
+            self._idx2word = []
+            print(
+                f"[SemanticSmoother] TinyModel mode | alpha={alpha:.2f}",
+                flush=True,
+            )
+
+    def _first_subword_token(self, word: str) -> int | None:
+        """Return the first subword token id of `word` (space-prefixed form preferred).
+
+        Filters out tokens that decode to purely whitespace/non-alpha (e.g. bare space tokens).
+        """
+        if word in self._first_tok_cache:
+            return self._first_tok_cache[word]
+        for form in (" " + word, word):
+            try:
+                ids = self._tokenizer(form, add_special_tokens=False)["input_ids"]
+            except Exception:
+                continue
+            if not ids:
+                continue
+            tid = ids[0]
+            # Verify the token decodes to something with at least one letter
+            decoded = self._tokenizer.decode([tid], skip_special_tokens=True).strip()
+            if any(c.isalpha() for c in decoded):
+                self._first_tok_cache[word] = tid
+                return tid
+        self._first_tok_cache[word] = None
+        return None
+
+    def _get_neighbors(self, word: str) -> dict[str, float]:
+        """Return {neighbor_word: cosine_similarity} for the given word."""
+        if self._ft is not None:
+            import numpy as _np
+            wi = self._ft.word2idx.get(word)
+            if wi is None:
+                return {}
+            target_vec = self._ft.matrix[wi]
+            sims = self._ft.matrix @ target_vec  # (N,)
+            top_idx = _np.argpartition(sims, -(self._top_k + 1))[-(self._top_k + 1):]
+            top_idx = top_idx[_np.argsort(-sims[top_idx])]
+            out: dict[str, float] = {}
+            for idx in top_idx:
+                nbr = self._idx2word[idx]
+                if nbr == word:
+                    continue
+                sim = float(sims[idx])
+                if sim < 0.3:
+                    break
+                out[nbr] = sim
+            return out
+        else:
+            return {w: s for w, s in self._tiny.neighbors.get(word, {}).items() if s >= 0.1}
+
+    def get_soft_targets_for_word(
+        self, word: str, first_token_id: int
+    ) -> dict[int, float] | None:
+        """Soft label distribution for the first-subword position of `word`.
+
+        Maps each semantically close neighbor to its own first subword token,
+        accumulating weights. Works for single-token and multi-token target words.
+        Returns None when no useful neighbors exist (falls back to hard CE).
+        """
+        key = (word, first_token_id)
+        if key in self._cache:
+            return self._cache[key]
+
+        if not word:
+            self._cache[key] = None
+            return None
+
+        neighbors = self._get_neighbors(word)
+        if not neighbors:
+            self._cache[key] = None
+            return None
+
+        # raw[token_id] = similarity score; target's first token anchored at 1.0
+        raw: dict[int, float] = {first_token_id: 1.0}
+        for nbr_word, sim in neighbors.items():
+            nbr_tok = self._first_subword_token(nbr_word)
+            if nbr_tok is not None:
+                raw[nbr_tok] = max(raw.get(nbr_tok, 0.0), sim)
+
+        if len(raw) == 1:
+            self._cache[key] = None
+            return None
+
+        Z = sum(raw.values())
+        norm = {t: w / Z for t, w in raw.items()}
+
+        # Blend: (1-alpha)*one_hot(first_token_id) + alpha*norm  → sums to 1
+        result: dict[int, float] = {}
+        for tid, w in norm.items():
+            result[tid] = ((1.0 - self.alpha) if tid == first_token_id else 0.0) + self.alpha * w
+
+        self._cache[key] = result
+        return result
+
+
+def _make_semantic_soft_trainer_cls(trl, smoother: "_SemanticSmoother", base_cls=None):
+    """Returns SFTTrainer subclass using semantic soft labels instead of hard CE.
+
+    At each completion's first-subword position, applies soft CE using word-level
+    FastText neighbors mapped to their first subword tokens (first-token approximation).
+    Continuation tokens and EOS use hard CE — the "which word" decision is fully
+    captured at the first token; continuations are deterministic given that choice.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    _Base = base_cls if base_cls is not None else trl.SFTTrainer
+
+    class _SemanticSoftSFTTrainer(_Base):
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
+            target_words = inputs.pop("target_word", None)  # list[str], length B
+            outputs = model(**inputs)
+            logits = outputs.logits
+            labels = inputs.get("labels")
+            if labels is None:
+                loss = outputs.loss
+                if return_outputs:
+                    return loss, outputs
+                return loss
+
+            shift_logits = logits[..., :-1, :].contiguous()  # (B, T-1, V)
+            shift_labels = labels[..., 1:].contiguous()       # (B, T-1)
+            B, T, V = shift_logits.shape
+
+            log_probs = F.log_softmax(shift_logits, dim=-1)  # (B, T-1, V)
+
+            per_token_losses: list[torch.Tensor] = []
+
+            for b in range(B):
+                word = (target_words[b] if target_words else "") or ""
+                active_t = (shift_labels[b] != -100).nonzero(as_tuple=True)[0]
+                for k, t in enumerate(active_t.tolist()):
+                    target_id = int(shift_labels[b, t].item())
+                    lp = log_probs[b, t]  # (V,) — has gradient
+
+                    soft = None
+                    if k == 0 and word:
+                        # First subword of the target word: apply semantic soft labels
+                        soft = smoother.get_soft_targets_for_word(word, target_id)
+
+                    if soft:
+                        q = lp.new_zeros(V)
+                        for tid, w in soft.items():
+                            if 0 <= tid < V:
+                                q[tid] += w
+                        per_token_losses.append(-(q * lp).sum())
+                    else:
+                        per_token_losses.append(-lp[target_id])
+
+            if not per_token_losses:
+                loss = outputs.loss if outputs.loss is not None else logits.sum() * 0.0
+            elif num_items_in_batch is not None:
+                # transformers 5.8+ passes total active tokens across all GA micro-batches;
+                # training_step does NOT divide by GA when model_accepts_loss_kwargs=True,
+                # so we must normalize by num_items_in_batch ourselves.
+                loss = torch.stack(per_token_losses).sum() / num_items_in_batch
+            else:
+                loss = torch.stack(per_token_losses).mean()
+
+            if return_outputs:
+                return loss, outputs
+            return loss
+
+    return _SemanticSoftSFTTrainer
+
+
+def _sft_attn_impl() -> str:
+    try:
+        import flash_attn as _fa
+        print(f"[sft] flash_attn {_fa.__version__} found → flash_attention_2", flush=True)
+        return "flash_attention_2"
+    except ImportError:
+        print("[sft] flash_attn not found → eager (not sdpa)", flush=True)
+        return "eager"
+
+
 def train_llm_sft(
     *,
     train_jsonl: str | Path,
@@ -1131,19 +1714,106 @@ def train_llm_sft(
     save_steps: int | None = None,
     save_total_limit: int = 2,
     resume_from_checkpoint: str | Path | bool | None = None,
+    score_min: int = 0,
+    score_weighted: bool = False,
+    semantic_smoothing: bool = False,
+    semantic_smoothing_alpha: float = 0.3,
+    fasttext_model_path: str | Path | None = None,
+    stop_on_garbage: bool = True,
+    max_seq_length: int = 1280,
+    use_liger: bool = True,
 ) -> None:
     enforce_hf_cache()
+    # Apply Liger Kernel fused linear cross-entropy before model loads.
+    # This replaces lm_head+CE with a single chunk-wise kernel that never
+    # materializes the full [seq × vocab] logits tensor — essential for
+    # long sequences (CoT reasoning traces) on 24 GB GPUs.
+    if use_liger:
+        try:
+            from liger_kernel.transformers.monkey_patch import _apply_liger_kernel
+            _apply_liger_kernel("qwen3", fused_linear_cross_entropy=True)
+            print("[LigerKernel] Fused linear cross-entropy applied for qwen3", flush=True)
+        except Exception as _liger_err:
+            print(f"[LigerKernel] Not applied ({_liger_err}); long sequences may OOM", flush=True)
     datasets, trl, peft = _import_training_stack()
     dataset = datasets.load_dataset("json", data_files=str(train_jsonl), split="train")
     has_prompt_completion = {"prompt", "completion"} <= set(dataset.column_names)
-    if not has_prompt_completion:
-        extra_columns = [column for column in dataset.column_names if column != "text"]
+
+    # Score filtering and weighting
+    has_score = "score" in dataset.column_names and any(
+        s is not None for s in dataset["score"][:min(10, len(dataset))]
+    )
+    if has_score and score_min > 0:
+        n_before = len(dataset)
+        dataset = dataset.filter(lambda ex: ex.get("score") is None or ex["score"] >= score_min)
+        print(f"Score filter (>={score_min}): {n_before} → {len(dataset)} examples", flush=True)
+    use_score_weighting = score_weighted and has_score
+
+    _MAX_LEN = max_seq_length
+
+    if has_prompt_completion:
+        # Pre-tokenize to input_ids+labels to bypass TRL 1.3.0 completion_only_loss bug
+        # (completion_mask gets silently dropped → all labels=-100 → loss=0 → no training)
+        from transformers import AutoTokenizer as _AutoTok
+        _tok = _AutoTok.from_pretrained(str(model_name), cache_dir=str(HF_CACHE_ROOT))
+
+        def _pretoken(ex):
+            prompt_ids = _tok(text=ex["prompt"])["input_ids"]
+            comp_ids = _tok(text=ex["completion"])["input_ids"]
+            # Reserve at least 64 tokens for the prompt (game context tail).
+            # If the completion alone exceeds _MAX_LEN - 64, truncate from the
+            # START of the completion (skip the beginning of <think> reasoning)
+            # to preserve the MOT: word<|im_end|> at the end — that's the label.
+            max_comp = _MAX_LEN - 64
+            if len(comp_ids) > max_comp:
+                comp_ids = comp_ids[-max_comp:]
+            max_prompt = max(1, _MAX_LEN - len(comp_ids))
+            if len(prompt_ids) > max_prompt:
+                prompt_ids = prompt_ids[-max_prompt:]  # keep tail (recent game context)
+            full_ids = prompt_ids + comp_ids
+            n_prompt = len(prompt_ids)
+            labels = [-100] * n_prompt + list(comp_ids)
+            row = {"input_ids": full_ids, "labels": labels}
+            if "score" in ex and ex["score"] is not None:
+                row["score"] = ex["score"]
+            # Extract bare target word for semantic smoothing.
+            # Handles both plain "mot<|im_end|>" and CoT "<think>...</think>\nMOT: mot<|im_end|>"
+            import re as _re
+            comp = ex.get("completion", "")
+            bare = _re.sub(r"<think>.*?</think>", "", comp, flags=_re.DOTALL)
+            bare = bare.replace("MOT:", "").replace("<|im_end|>", "").replace("<|endoftext|>", "").strip()
+            row["target_word"] = bare.lower() if bare.isalpha() else ""
+            return row
+
+        print("Pre-tokenizing prompt/completion dataset...", flush=True)
+        keep_cols = {"score", "target_word"} if has_score else {"target_word"}
+        remove_cols = [c for c in dataset.column_names if c not in keep_cols]
+        dataset = dataset.map(_pretoken, remove_columns=remove_cols, desc="Pre-tokenizing")
+        n_active = sum(1 for ex in dataset if any(l != -100 for l in ex["labels"]))
+        print(f"Pre-tokenized {len(dataset)} examples, {n_active} with active labels", flush=True)
+    else:
+        extra_columns = [c for c in dataset.column_names if c not in {"text"}]
         if extra_columns:
             dataset = dataset.remove_columns(extra_columns)
+
     if save_steps is None:
         effective_save_steps = eval_every_n_steps if eval_every_n_steps else max(25, max_steps)
     else:
         effective_save_steps = max(1, int(save_steps))
+
+    # Pre-load the model in bfloat16 with FA2 — SFTConfig.model_init_kwargs gets
+    # stripped by _supported_kwargs if SFTConfig doesn't declare it, causing float32
+    # loading (108 GB for 27B) which overflows 79 GB VRAM.
+    import torch as _torch
+    from transformers import AutoModelForCausalLM as _AMLM
+    _attn_impl = _sft_attn_impl()
+    print(f"[sft] pre-loading model {model_name} in bfloat16 + {_attn_impl}", flush=True)
+    _pre_model = _AMLM.from_pretrained(
+        model_name,
+        torch_dtype=_torch.bfloat16,
+        attn_implementation=_attn_impl,
+    )
+
     config_kwargs = dict(
         output_dir=str(output_dir),
         max_steps=max_steps,
@@ -1154,16 +1824,17 @@ def train_llm_sft(
         save_steps=effective_save_steps,
         save_strategy="steps",
         save_total_limit=max(1, int(save_total_limit)),
-        max_length=512,
+        max_length=_MAX_LEN,
         report_to=[],
         use_cpu=use_cpu,
         optim="adamw_torch",
         seed=seed,
-        model_init_kwargs={"torch_dtype": "auto"},
+        bf16=not use_cpu,
+        remove_unused_columns=not use_score_weighting and not semantic_smoothing,
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
     )
-    if has_prompt_completion:
-        config_kwargs["completion_only_loss"] = True
-    else:
+    if not has_prompt_completion:
         config_kwargs["dataset_text_field"] = "text"
     config = trl.SFTConfig(
         **_supported_kwargs(
@@ -1194,16 +1865,83 @@ def train_llm_sft(
                 every=eval_every_n_steps,
                 evaluator=evaluator,
                 label="eval",
+                max_game_steps=eval_max_game_steps,
+                stop_on_garbage=stop_on_garbage,
             )
         )
 
-    trainer = trl.SFTTrainer(
-        model=model_name,
+    # Build trainer class: semantic smoothing wraps the base (or score-weighted) class.
+    # When liger is active, outputs.logits is None — wrap base to return outputs.loss directly.
+    _raw_base = _make_score_weighted_trainer_cls(trl) if use_score_weighting else trl.SFTTrainer
+    if use_liger:
+        class _LigerBase(_raw_base):
+            def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
+                outputs = model(**inputs)
+                if outputs.logits is None:
+                    loss = outputs.loss
+                    if return_outputs:
+                        return loss, outputs
+                    return loss
+                return super().compute_loss(model, inputs, return_outputs=return_outputs,
+                                            num_items_in_batch=num_items_in_batch, **kwargs)
+        _base_cls = _LigerBase
+    else:
+        _base_cls = _raw_base
+    if semantic_smoothing:
+        from transformers import AutoTokenizer as _AutoTokSm
+        _sm_tokenizer = _AutoTokSm.from_pretrained(str(model_name), cache_dir=str(HF_CACHE_ROOT))
+        # Prefer FastText (proper cosine similarity) over TinyModel (co-occurrence proxy)
+        if fasttext_model_path and Path(fasttext_model_path).exists():
+            from .model import FastTextWikiModel as _FTModel
+            print(f"[SemanticSmoother] Loading FastText model from {fasttext_model_path} ...", flush=True)
+            _sm_sim_model = _FTModel.load(fasttext_model_path)
+        elif tiny_model_path:
+            print("[SemanticSmoother] No FastText model found; falling back to TinyModel", flush=True)
+            _sm_sim_model = TinyPedantixModel.load(tiny_model_path)
+        else:
+            print("Warning: --semantic-smoothing requires --fasttext-model or --tiny-model; disabling", flush=True)
+            _sm_sim_model = None
+        if _sm_sim_model is not None:
+            smoother = _SemanticSmoother(_sm_sim_model, _sm_tokenizer, alpha=semantic_smoothing_alpha)
+            TrainerClass = _make_semantic_soft_trainer_cls(trl, smoother, base_cls=_base_cls)
+        else:
+            TrainerClass = _base_cls
+    else:
+        TrainerClass = _base_cls
+    # Pass dataset without score column — we inject weights after tokenization
+    # Keep target_word if semantic smoothing is active; always drop score here
+    drop_cols = []
+    if has_score and "score" in dataset.column_names:
+        drop_cols.append("score")
+    use_semantic = semantic_smoothing and ("target_word" in dataset.column_names)
+    if not use_semantic and "target_word" in dataset.column_names:
+        drop_cols.append("target_word")
+    train_ds = dataset.remove_columns(drop_cols) if drop_cols else dataset
+    trainer = TrainerClass(
+        model=_pre_model,
         args=config,
-        train_dataset=dataset,
+        train_dataset=train_ds,
         peft_config=peft_config,
         callbacks=callbacks or None,
     )
+
+    # Wrap collator to pass string target_word through (must come before score wrapper)
+    if use_semantic:
+        trainer.data_collator = _WordAwareCollator(trainer.data_collator)
+
+    # Inject score_weight into the tokenized dataset and wrap collator
+    if use_score_weighting:
+        sw_list = [
+            float(s) / 100.0 if s is not None else 1.0
+            for s in dataset["score"]
+        ]
+        if len(sw_list) == len(trainer.train_dataset):
+            trainer.train_dataset = trainer.train_dataset.add_column("score_weight", sw_list)
+            trainer.data_collator = _ScoreAwareCollator(trainer.data_collator)
+            print(f"Score-weighted training: {sum(w > 0 for w in sw_list)} examples with weight>0", flush=True)
+        else:
+            print("Warning: score weight size mismatch; falling back to uniform weights", flush=True)
+
     trainer_holder["trainer"] = trainer
     resume_arg: object
     if resume_from_checkpoint in (None, False):
@@ -1261,10 +1999,12 @@ def train_llm_grpo(
     dagger_oracle_top_k: int = 8,
     dagger_oracle_temperature: float = 1.0,
     dagger_oracle_min_idf: float = 0.0,
+    stop_on_garbage: bool = True,
+    use_constrained_decoding: bool = False,
 ) -> None:
     enforce_hf_cache()
     datasets, trl, peft = _import_training_stack()
-    similarity_model = TinyPedantixModel.load(tiny_model_path)
+    similarity_model = _load_similarity_model(tiny_model_path)
     dataset = datasets.load_dataset("json", data_files=str(train_jsonl), split="train")
     dataset = _prepare_grpo_prompts(dataset, model_name_or_path)
     model_arg = _load_peft_model_if_adapter(model_name_or_path)
@@ -1276,6 +2016,18 @@ def train_llm_grpo(
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
     generation_kwargs = _qwen_no_think_generation_kwargs(tokenizer, tokenizer_name)
+    # Build constraint fn here (trie is cached); inject into model.generate after trainer is created
+    _grpo_constraint_fn = None
+    if use_constrained_decoding:
+        from pedantix_project.constrained_decoding import build_french_constraint
+        constrained_vocab = None  # full fr_FR.dic — is_valid_guess doesn't require TinyModel vocab
+        _grpo_constraint_fn = build_french_constraint(
+            tokenizer, prompt_length=None,
+            extra_exclusions=STOPWORDS | INVALID_GUESSES,
+            allowed_vocab=constrained_vocab,
+            dynamic=True,
+        )
+        print("[GRPO] constrained decoding trie ready (dynamic mode)", flush=True)
 
     def reward_func(prompts, completions, title, intro, history, **kwargs):
         rewards = []
@@ -1304,7 +2056,7 @@ def train_llm_grpo(
             logging_steps=logging_steps,
             save_steps=save_steps or max(25, max_steps),
             save_total_limit=2,
-            max_prompt_length=512,
+            max_prompt_length=1024,
             max_completion_length=max_completion_length,
             num_generations=num_generations,
             temperature=temperature,
@@ -1336,12 +2088,15 @@ def train_llm_grpo(
             eval_num_generations=eval_num_generations,
             eval_batch_size=eval_batch_size,
             seed=seed,
+            use_constrained=use_constrained_decoding,
         )
         callbacks.append(
             _build_periodic_eval_callback(
                 every=eval_every_n_steps,
                 evaluator=evaluator,
                 label="eval",
+                max_game_steps=eval_max_game_steps,
+                stop_on_garbage=stop_on_garbage,
             )
         )
 
@@ -1378,6 +2133,19 @@ def train_llm_grpo(
         callbacks=callbacks or None,
     )
     trainer_holder["trainer"] = trainer
+    if _grpo_constraint_fn is not None:
+        # Monkey-patch trainer.model.generate to inject prefix_allowed_tokens_fn.
+        # On single-GPU, accelerator.unwrap_model returns the same object, so
+        # this patch applies to the actual generate() call inside TRL's training step.
+        _orig_generate = trainer.model.generate
+        _cfn = _grpo_constraint_fn
+        def _constrained_generate(*args, **kwargs):
+            # Don't override if caller (e.g. eval) already set its own constraint fn
+            if "prefix_allowed_tokens_fn" not in kwargs:
+                kwargs["prefix_allowed_tokens_fn"] = _cfn
+            return _orig_generate(*args, **kwargs)
+        trainer.model.generate = _constrained_generate
+        print("[GRPO] constrained decoding active on trainer.model.generate", flush=True)
     trainer.train(resume_from_checkpoint=str(resume_from_checkpoint) if resume_from_checkpoint else None)
     trainer.save_model(str(output_dir))
     if log_path:
@@ -1403,15 +2171,13 @@ def _feedback_step(
     guess: str,
 ) -> dict:
     guessed = {str(step.get("guess", "")) for step in history}
-    reward = score_completion(
-        title=page.title,
-        intro=page.intro,
-        history=history,
-        completion=f"MOT: {guess}",
-        similarity_model=similarity_model,
-    )
+    game = replay_game(page, similarity_model, history)
+    # 0-100 display score (raw max-sim to any page word) — used by make_prompt
+    score = compute_page_max_sim(game, guess)
+    reward = score_guess_on_game(game, guess, history_len=len(history), guessed=guessed)
     return {
         "guess": reward.guess,
+        "score": score,
         "exact": reward.exact_hits,
         "semantic": reward.semantic_hits,
         "title": reward.title_hits,
@@ -1621,6 +2387,8 @@ def _build_periodic_eval_callback(
     every: int,
     evaluator,
     label: str = "eval",
+    max_game_steps: int = 30,
+    stop_on_garbage: bool = True,
 ):
     from transformers import TrainerCallback
 
@@ -1629,16 +2397,21 @@ def _build_periodic_eval_callback(
             self.every = max(1, int(every))
             self.last_eval = 0
             self.label = label
+            self._stop_requested = False
 
-        def _run(self, state, step: int) -> None:
+        def _run(self, state, step: int) -> bool:
+            """Returns True if garbage was detected and training should stop."""
             if step <= 0 or step <= self.last_eval:
-                return
+                return False
             self.last_eval = step
             try:
+                import torch as _torch
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
                 result = evaluator(step)
             except Exception as exc:
                 print(f"[{self.label}@step{step}] failed: {exc!r}")
-                return
+                return False
             entry: dict = {"step": step, f"{self.label}/done": True}
             for key, value in result.items():
                 if isinstance(value, (int, float, str, bool)):
@@ -1646,10 +2419,39 @@ def _build_periodic_eval_callback(
             state.log_history.append(entry)
             print(f"[{self.label}@step{step}] {json.dumps(entry, ensure_ascii=False)}")
 
+            if not stop_on_garbage:
+                return False
+
+            # Garbage detection: model spamming same word or pure fallback
+            n_pages = result.get("pages", 0)
+            total_steps = max(1, n_pages * max_game_steps)
+            fallbacks = result.get("generation_fallbacks", 0)
+            rejected_rep = result.get("generation_rejected_repeated", 0)
+            fallback_rate = fallbacks / total_steps
+            rep_rate = rejected_rep / total_steps
+
+            # Top-word concentration: if one word appears in >40% of first-10 slots
+            top_words = result.get("common_first_10_words", [])
+            top_count = top_words[0][1] if top_words else 0
+            top_rate = top_count / max(1, n_pages * 10)
+
+            is_garbage = (fallback_rate > 0.40) or (rep_rate > 1.5) or (top_rate > 0.40)
+            if is_garbage:
+                print(
+                    f"[{self.label}@step{step}] GARBAGE DETECTED — "
+                    f"fallback_rate={fallback_rate:.2f} rep_rate={rep_rate:.2f} "
+                    f"top_word_rate={top_rate:.2f} top_word={top_words[0] if top_words else None}. "
+                    f"Stopping training early."
+                )
+            return is_garbage
+
         def on_step_end(self, args, state, control, **kwargs):
             step = int(state.global_step)
             if self.every > 0 and step > 0 and step % self.every == 0:
-                self._run(state, step)
+                if self._run(state, step):
+                    self._stop_requested = True
+            if self._stop_requested:
+                control.should_training_stop = True
             return control
 
         def on_train_end(self, args, state, control, **kwargs):
@@ -1902,6 +2704,9 @@ def _build_dagger_callback(
                 return {"pairs": 0, "microsteps": 0, "bc_loss_first": None, "bc_loss_last": None}
 
             self.rng.shuffle(pairs)
+            _gc.collect()
+            if _torch.cuda.is_available():
+                _torch.cuda.empty_cache()
             losses: list[float] = []
             for s in range(bc_microsteps):
                 start = (s * bc_batch_size) % max(1, len(pairs))
@@ -1948,6 +2753,7 @@ def _make_held_out_evaluator(
     eval_num_generations: int,
     eval_batch_size: int,
     seed: int,
+    use_constrained: bool = False,
 ):
     """Return a callable(step) -> eval-result dict that runs game simulations
     against the live in-memory trainer model (avoids loading a second copy)."""
@@ -1993,6 +2799,7 @@ def _make_held_out_evaluator(
                     chat_format=chat_format,
                     generation_batch_size=eval_batch_size,
                     eval_num_generations=eval_num_generations,
+                    constrained=use_constrained,
                 )
         finally:
             if was_training:

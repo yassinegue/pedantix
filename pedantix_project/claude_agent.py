@@ -19,6 +19,7 @@ from .llm_policy import (
     _apply_llm_exact_reveals,
     _is_real_french_word,
     compact_visible_text,
+    compute_page_max_sim,
     extract_guess,
     make_prompt,
     score_guess_on_game,
@@ -28,9 +29,8 @@ from .simulator import PedantixGame
 
 
 _SYSTEM_PROMPT = (
-    "Tu joues à Pedantix, un jeu de devinette de mots français. "
-    "Réponds UNIQUEMENT avec 'MOT: <mot>' en minuscules, sans accent si tu préfères. "
-    "Un seul mot par réponse, rien d'autre."
+    "Tu es un expert Wikipedia francais. Tu dois deviner le titre d'un article en proposant des mots un par un. "
+    "Reponds UNIQUEMENT avec 'MOT: <mot>' en minuscules. Un seul mot, rien d'autre."
 )
 
 
@@ -72,7 +72,7 @@ def play_game_with_claude(
             try:
                 msg = client.messages.create(
                     model=model,
-                    max_tokens=16,
+                    max_tokens=10,
                     system=_SYSTEM_PROMPT,
                     messages=[{"role": "user", "content": prompt}],
                 )
@@ -88,6 +88,7 @@ def play_game_with_claude(
         if not guess:
             guess = "france"
 
+        score = compute_page_max_sim(game, guess)
         result = score_guess_on_game(
             game, guess, history_len=len(history), guessed=guessed
         )
@@ -98,6 +99,7 @@ def play_game_with_claude(
             {
                 "guess": guess,
                 "exact": result.exact_hits,
+                "score": score,
                 "semantic": result.semantic_hits,
                 "title": result.title_hits,
                 "reward": round(result.reward, 4),

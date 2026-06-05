@@ -37,7 +37,7 @@ def canonical_word(value: str) -> str:
     word = normalize_word(value)
     if len(word) <= 3:
         return word
-     if word == "pays":
+    if word == "pays":
         return word
     if word.endswith(("ais", "ois", "is")):
         return word
